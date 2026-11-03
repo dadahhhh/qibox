@@ -421,7 +421,7 @@ export class AIProvider {
         trace.response(response.status);
         if (!response.ok) {
           let modelError = '', modelErrorCode = '', modelErrorType = '';
-          if (response.status === 400 || response.status === 413 || response.status === 422) {
+          if ([400, 413, 415, 422].includes(response.status)) {
             try {
               const raw = await response.text();
               const data = JSON.parse(raw.slice(0, 8192));
@@ -435,6 +435,20 @@ export class AIProvider {
             console.warn('[ai-model-rejected]', JSON.stringify({ status: response.status, contextTooLarge,
               code: modelErrorCode, type: modelErrorType, messagePresent: !!modelError }));
           if (validImages.length && [400,415,422].includes(response.status)) {
+            // A malformed picture, context overflow or rejected token budget
+            // does not establish that the model lacks vision. Preserve images
+            // on the existing budget retry; never silently turn other failures
+            // into a text-only answer.
+            const unsupportedImages = /(?:model|endpoint|api).{0,60}(?:does not support|doesn't support|cannot accept|not support).{0,30}(?:image|vision|multimodal)|(?:image(?:_url)?|vision|multimodal)(?:[ -](?:input|inputs|content|messages))?\s+(?:(?:is|are)\s+)?(?:not supported|unsupported)|only supports? text|text[- ]only model/i.test(modelError);
+            if (!unsupportedImages || contextTooLarge) {
+              const existingTextFallback = !requireImages && !textInput.onlyImages && (textInput.mode !== 'reply' || (textInput.messages || []).some(message => textInput.conversation?.pendingIncomingIds?.includes(message?.id) && message?.type !== 'image' && message?.unresolved !== true));
+              if (!contextTooLarge && existingTextFallback && !structuredReply && format !== 'report' && remainingOutput === null && budget && response.status === 400 && !droppedBudget && retry && /max[_ -]?(?:tokens|completion_tokens|output_tokens)|output[_ -]?token/i.test(modelError)) {
+                budget = 0; droppedBudget = true; continue;
+              }
+              throw new AppError(contextTooLarge
+                ? '模型上下文容量不足，无法一次处理当前聊天范围；请缩小范围或更换长上下文模型'
+                : `图片请求被接口拒绝（HTTP ${response.status}），请检查图片数据和请求参数；不能据此判定模型不支持图片`, 400, 'ai_model_image_request');
+            }
             if (requireImages) throw new AppError('当前模型不支持图片输入', 400, 'ai_model_vision_unsupported');
             const readable = readableMediaInput(textInput, { dropImages: true });
             return textInput.onlyImages || textInput.mode === 'reply' && !readable.conversation?.pendingIncomingIds.length ? {action:'skip',mediaSkipped:true}
@@ -561,3 +575,4 @@ export class AIProvider {
   }
   async test(config, signal) { const result = await this.complete(config, '连接测试。只返回 JSON 对象 {"ok":true}。', { test: true }, signal); if (result.ok !== true) throw new AppError('模型未通过格式测试，请检查模型名称'); }
 }
+
